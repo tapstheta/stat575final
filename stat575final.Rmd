@@ -1,0 +1,321 @@
+---
+title: "stat575final"
+output:
+  pdf_document: default
+  html_document: default
+date: "2024-04-20"
+---
+##Base Visual
+```{r}
+library(GPvecchia)
+library(hdf5r) 
+library(ggplot2) 
+
+rawh5 = h5file("ssta.h5")
+
+lat = rawh5[["latitude"]][]
+lon = rawh5[["longitude"]][]
+ssta = rawh5[["raw_ssta"]][,]
+clouds = rawh5[["cloud_index"]][,] 
+
+pts = expand.grid(lon = lon, lat = lat)
+
+clouds_vector = as.vector(t(clouds))  
+ssta_vector = as.vector(t(ssta))
+
+pts$cloud_index = clouds_vector
+pts$ssta = ssta_vector
+
+pts <- pts %>% 
+  filter(lat >= 13, lat <= 18, lon >= -105, lon <= -90)
+
+pts_valid = pts[pts$cloud_index == 0 & !is.na(pts$ssta),]
+
+ggplot(pts_valid, aes(x = lon, y = lat, fill = ssta)) +
+  geom_tile() +
+  scale_fill_viridis_c(option = "C", direction = -1, name = "SST Celsius", na.value = "white") +
+  labs(title = "Sea Surface Temperature Anomalies", x = "Longitude", y = "Latitude") +
+  theme_minimal() +
+  coord_fixed(1.3)
+
+```
+
+
+
+##10 50 & 100-NN approx
+```{r}
+library(hdf5r)
+library(ggplot2)
+library(dplyr)
+
+rawh5 <- h5file("ssta.h5")
+
+lat <- rawh5[["latitude"]][]
+lon <- rawh5[["longitude"]][]
+ssta <- rawh5[["raw_ssta"]][,]
+clouds <- rawh5[["cloud_index"]][,]
+
+pts <- expand.grid(lon = lon, lat = lat)
+pts$ssta <- as.vector(t(ssta))
+pts$cloud_index <- as.vector(t(clouds))
+
+pts$valid <- !is.na(pts$ssta) & pts$cloud_index == 0
+pts$cloudy <- is.na(pts$ssta) & pts$cloud_index == 1
+#pts$land <- pts$cloud_index == 2
+pts$land <- pts$cloudy == FALSE & pts$valid == FALSE
+
+pts <- pts %>% 
+  filter(lat >= 13, lat <= 18, lon >= -105, lon <= -90)
+
+set.seed(123)  
+pts_subset <- sample_frac(pts, 1)
+
+interpolate_ssta <- function(lon, lat, data, k = 100) {
+  if (!data[data$lon == lon & data$lat == lat,]$cloudy) {
+    return(data[data$lon == lon & data$lat == lat,]$ssta)
+  }
+
+  distances <- sqrt((data$lon - lon)^2 + (data$lat - lat)^2)
+  data$distance <- distances
+
+  
+  neighbors <- data %>% 
+    filter(valid) %>%
+    arrange(distance) %>%
+    head(k)
+
+  if (nrow(neighbors) > 0) {
+    mean(neighbors$ssta, na.rm = TRUE)
+  } else {
+    NA  
+  }
+}
+
+pts_subset$interpolated_ssta <- ifelse(pts_subset$cloudy & !pts_subset$land,
+                                mapply(interpolate_ssta, pts_subset$lon, pts_subset$lat, MoreArgs = list(data = pts_subset)),
+                                ifelse(pts_subset$land, NA, pts_subset$ssta))
+
+
+ggplot(pts_subset, aes(x = lon, y = lat, fill = interpolated_ssta)) +
+  geom_tile(width = 0.1, height = 0.1) +  
+  scale_fill_viridis_c(option = "C", direction = -1, name = "SSTA (°C)", na.value = "white") +
+  labs(title = "Interpolated Sea Surface Temperature 100-NN", x = "Longitude", y = "Latitude") +
+  theme_minimal()+
+  coord_fixed(1.3)
+
+```
+
+
+
+Ordinary Kriging
+```{r}
+library(hdf5r)
+library(ggplot2)
+library(fields)
+library(dplyr)
+
+rawh5 <- h5file("ssta.h5")
+lat <- rawh5[["latitude"]][]
+lon <- rawh5[["longitude"]][]
+ssta <- rawh5[["raw_ssta"]][,]
+clouds <- rawh5[["cloud_index"]][,]
+
+pts <- expand.grid(lon = lon, lat = lat)
+clouds_vector <- as.vector(t(clouds))
+ssta_vector <- as.vector(t(ssta))
+
+pts$cloud_index = clouds_vector
+pts$ssta = ssta_vector
+
+pts_cloudy <- pts %>%
+  filter(lat >= 13, lat <= 18, lon >= -105, lon <= -90) %>%
+  filter(cloud_index == 1, is.na(ssta)) 
+
+pts_valid <- pts %>%
+  filter(cloud_index == 0, !is.na(ssta))  
+
+set.seed(123)  
+pts_valid_sample <- pts_valid %>% 
+  sample_frac(size = 0.01)
+
+
+krig_fit <- Krig(cbind(pts_valid_sample$lon, pts_valid_sample$lat), pts_valid_sample$ssta, theta = 10)
+
+grid <- expand.grid(lon = seq(min(pts_valid_sample$lon), max(pts_valid_sample$lon), length.out = 50),
+                    lat = seq(min(pts_valid_sample$lat), max(pts_valid_sample$lat), length.out = 50))
+
+predictions <- predict(krig_fit, x = grid)
+
+library(ggplot2)
+ggplot(grid, aes(x = lon, y = lat, fill = predictions)) +
+  geom_tile() +
+  scale_fill_viridis_c(option = "C", direction = -1, name = "Predicted SSTA") +
+  labs(title = "Kriged Predictions of SSTA", x = "Longitude", y = "Latitude") +
+  theme_minimal() +
+  coord_fixed(1.3)
+
+```
+
+##Ordinary kriging
+```{r}
+library(gstat)
+library(sp)
+library(hdf5r)
+library(ggplot2)
+
+rawh5 <- h5file("ssta.h5")
+
+lat <- rawh5[["latitude"]][]
+lon <- rawh5[["longitude"]][]
+ssta_matrix <- rawh5[["raw_ssta"]][,]
+clouds_matrix <- rawh5[["cloud_index"]][,]
+
+pts <- expand.grid(lon = lon, lat = lat)
+ssta_vector <- as.vector(t(ssta_matrix))
+clouds_vector <- as.vector(t(clouds_matrix))
+pts <- data.frame(pts, cloud_index = clouds_vector, ssta = ssta_vector)
+
+pts <- pts[pts$lat >= 13 & pts$lat <= 18 & pts$lon >= -105 & pts$lon <= -90,]
+
+coordinates(pts) <- ~lon+lat
+
+cloudy_points <- pts[pts$cloud_index == 1 & is.na(pts$ssta),]
+
+set.seed(123)  
+sampled_cloudy_points <- cloudy_points[sample(nrow(cloudy_points), size = ceiling(1 * nrow(cloudy_points))), ]
+
+valid_data_points <- pts[!is.na(pts$ssta) & pts$cloud_index == 0,]
+
+v <- variogram(ssta ~ 1, valid_data_points)
+v.fit <- fit.variogram(v, model = vgm(1, "Exp", 900, 1))
+
+kriging_result <- krige(ssta ~ 1, valid_data_points, newdata = sampled_cloudy_points, model = v.fit)
+
+kriging_df <- as.data.frame(kriging_result)
+kriging_df$lon <- coordinates(kriging_result)[,1]
+kriging_df$lat <- coordinates(kriging_result)[,2]
+
+valid_pts_df <- as.data.frame(valid_data_points)
+valid_pts_df$lon <- coordinates(valid_data_points)[,1]
+valid_pts_df$lat <- coordinates(valid_data_points)[,2]
+
+all_pts <- rbind(
+  data.frame(lon = valid_pts_df$lon, lat = valid_pts_df$lat, ssta = valid_pts_df$ssta, cloud_index = valid_pts_df$cloud_index),
+  data.frame(lon = kriging_df$lon, lat = kriging_df$lat, ssta = kriging_df$var1.pred, cloud_index = rep(1, nrow(kriging_df)))
+)
+
+```
+
+
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+all_pts$lon <- round(all_pts$lon, digits = 2) 
+all_pts$lat <- round(all_pts$lat, digits = 2)
+
+all_pts_agg <- all_pts %>%
+  group_by(lon, lat) %>%
+  summarise(ssta = mean(ssta), .groups = 'drop')  
+
+ggplot(all_pts_agg, aes(x = lon, y = lat, fill = ssta)) +
+  geom_tile() + 
+  scale_fill_viridis_c(option = "C", name = "SSTA") +
+  labs(title = "Spatial Interpolation of SSTA",
+       subtitle = "Exponential Cov",
+       x = "Longitude",
+       y = "Latitude") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) 
+
+```
+
+##Lattice Krig
+```{r}
+library(dplyr)
+library(hdf5r)
+library(fields)
+library(ggplot2)
+
+rawh5 <- h5file("ssta.h5")
+lat <- rawh5[["latitude"]][]
+lon <- rawh5[["longitude"]][]
+ssta <- as.vector(t(rawh5[["raw_ssta"]][,]))
+clouds <- as.vector(t(rawh5[["cloud_index"]][,]))
+
+pts <- data.frame(lon = lon, lat = lat, ssta = ssta, cloud_index = clouds) %>%
+  filter(lat >= 13, lat <= 15, lon >= -105, lon <= -93) 
+
+pts_cloudy <- pts %>%
+  filter(cloud_index == 1) 
+
+pts_valid <- pts %>%
+  filter(cloud_index == 0, !is.na(ssta)) 
+
+krig_fit <- Krig(cbind(pts_valid$lon, pts_valid$lat), pts_valid$ssta, theta = 10)
+
+prediction_grid <- expand.grid(lon = seq(min(pts_cloudy$lon), max(pts_cloudy$lon), length.out = 1000),
+                               lat = seq(min(pts_cloudy$lat), max(pts_cloudy$lat), length.out = 1000))
+
+predictions <- predict(krig_fit, x = prediction_grid)
+prediction_grid$ssta_predicted <- predictions
+
+# Plot
+ggplot(prediction_grid, aes(x = lon, y = lat, fill = ssta_predicted)) +
+  geom_tile() +
+  scale_fill_viridis_c(option = "C", direction = -1, name = "Predicted SSTA") +
+  labs(title = "Interpolated SSTA- exp cov", x = "Longitude", y = "Latitude") +
+  theme_minimal() +
+  coord_fixed(1.3)
+
+
+```
+
+##Vecchia Approximation
+
+```{r}
+library(GpGp)
+library(hdf5r)  # For reading HDF5 files
+
+# Open the HDF5 file
+rawh5 <- h5file("ssta.h5")
+
+# Extract latitude, longitude, and SSTA data
+lat <- rawh5[["latitude"]][]
+lon <- rawh5[["longitude"]][]
+ssta_matrix <- rawh5[["raw_ssta"]][,]
+ssta <- as.vector(t(ssta_matrix))  # Ensure correct orientation
+
+# Create a matrix where each row corresponds to coordinates for each SSTA value
+pts <- expand.grid(lon = lon, lat = lat)
+ssta_nomissing <- ssta[!is.na(ssta)]
+pts_nomissing <- pts[!is.na(ssta),]
+
+# Fit a Gaussian process model using Vecchia approximation
+# Assuming m=10 conditioning points (modify based on your specific needs)
+est <- fit_model(ssta_nomissing, pts_nomissing, covfun_name = "exponential_isotropic", m_seq=c(10))
+##########################################################################
+# Read in the "ground truth" data for prediction locations
+nasa <- read.csv("/Users/tya_nangpal/Downloads/nasa_groundtruth_clouds.csv")
+pred_pts <- as.matrix(nasa[, 1:2])  # Assuming first two columns are coordinates
+pred_truth <- nasa[, 3]  # Ground truth data
+
+# Prepare for prediction
+pred_X <- matrix(1, nrow = nrow(pred_pts), ncol = 1)  # Assuming model needs an intercept
+
+# Make predictions at NASA provided locations
+my_pred <- predictions(est, pred_pts, pred_X)
+
+# Results now contain predictions at specified locations
+# Assuming pred_pts includes longitude and latitude in the first two columns
+ggplot(nasa, aes(x = longitude, y = latitude, fill = abs(my_pred - pred_truth))) +
+  geom_tile() +  # Using tiles to create a heatmap effect
+  scale_fill_viridis_c(name = "Pred Error", option = "C") +
+  labs(title = "Spatial Distribution of Prediction Error- Exponential Isotropic",
+       x = "Longitude",
+       y = "Latitude") +
+  coord_fixed(1.3) +
+  theme_minimal()
+
+```
